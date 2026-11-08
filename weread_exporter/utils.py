@@ -133,9 +133,8 @@ async def fetch(
                     # response.raise_for_status()
                     result = await response.read()
                     if respond_with_headers:
-                        # 转换 headers 为字典以匹配类型注解
-                        headers_dict = {k: v for k, v in response.headers.items()}
-                        return response.status, headers_dict, result
+                        # 保留 CIMultiDict，支持 getall("Set-Cookie") 多值读取
+                        return response.status, response.headers, result
                     else:
                         return result
             except:

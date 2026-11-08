@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 import sys
 from typing import Callable, Optional, List
 
@@ -64,9 +65,9 @@ async def async_main() -> int:
     )
     parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
         "--load-interval",
-        help="load chapter page interval time",
+        help="min rest time between chapters in seconds, actual rest is randomized to interval + 0~90s (default: 60)",
         type=int,
-        default=30,
+        default=60,
     )
     parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
         "--css-file",
@@ -77,6 +78,12 @@ async def async_main() -> int:
     )
     parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
         "--force-login", help="force login first", action="store_true", default=False
+    )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--login-timeout",
+        help="login QR code timeout in seconds (default: 60)",
+        type=int,
+        default=60,
     )
     parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
         "--use-default-profile",
@@ -124,36 +131,62 @@ async def async_main() -> int:
         if not await page.check_valid():
             logging.warning("Book %s status is invalid, stop exporting" % book_id)
             continue
+
+        # Check login status before launching browser
+        if not args.force_login and not page._cookie.get("wr_vid"):
+            print("\n" + "=" * 60)
+            print("⚠️  Login Required")
+            print("=" * 60)
+            print("No login session found. This is likely your first time using the tool.")
+            print()
+            print("To use this tool, you need to:")
+            print("  1. Add the --force-login parameter to trigger login")
+            print("  2. Run: python -m weread_exporter -b %s -o epub --force-login" % book_id)
+            print()
+            print("Your first run will:")
+            print("  - Open a browser window")
+            print("  - Display a WeChat QR code")
+            print("  - Wait for you to scan with WeChat mobile app")
+            print("  - Save your login session for future use")
+            print()
+            print("After first login, you can omit --force-login parameter.")
+            print("=" * 60 + "\n")
+            logging.error("No login session found. Please use --force-login parameter for first-time use.")
+            return -1
+        elif not args.force_login:
+            logging.info("Found existing login session (wr_vid=%s)" % page._cookie.get("wr_vid"))
+
         save_path = os.path.join("cache", book_id)
         output_dir = "output"
         if not os.path.isdir(output_dir):
             os.mkdir(output_dir)
         exporter = export.WeReadExporter(page, save_path)
-        while True:
+        for attempt in range(3):
             try:
-                await page.launch(
-                    headless=args.headless,  # pyright: ignore[reportAny]
-                    force_login=args.force_login,  # pyright: ignore[reportAny]
-                    use_default_profile=args.use_default_profile,  # pyright: ignore[reportAny]
-                    mock_user_agent=args.mock_user_agent,  # pyright: ignore[reportAny]
-                    proxy_server=args.proxy_server,  # pyright: ignore[reportAny]
-                )
-            except utils.BreakExportingError:
-                logging.info("Exit process...")
-                return -1
-            except RuntimeError:
-                logging.exception("Launch book %s home page failed" % book_id)
-                await asyncio.sleep(2)
-                continue
-
-            try:
+                try:
+                    await page.launch(
+                        headless=args.headless,
+                        force_login=args.force_login,
+                        use_default_profile=args.use_default_profile,
+                        mock_user_agent=args.mock_user_agent,
+                        proxy_server=args.proxy_server,
+                        login_timeout=args.login_timeout,
+                    )
+                except utils.BreakExportingError:
+                    logging.info("Exit process...")
+                    return -1
                 await exporter.export_markdown(args.load_timeout, args.load_interval)
-            except utils.LoadChapterFailedError:
-                logging.warning("Load chapter failed, close browser and retry")
-                await page.close()
+            except utils.LoginRequiredError:
+                raise
+            except RuntimeError:
+                logging.exception("Book %s browser attempt %d/3 failed" % (book_id, attempt + 1))
+                if attempt == 2:
+                    raise
             else:
-                await page.close()
                 break
+            finally:
+                await page.close()
+            await asyncio.sleep(2)
 
         await exporter.pre_process_markdown()
         title = await exporter.get_book_title()
@@ -207,6 +240,12 @@ async def async_main() -> int:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        # emoji in prompts crash on GBK consoles; degrade instead of raising
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     if sys.platform == "win32":
         patch_windows()
     elif sys.platform == "darwin":
@@ -221,13 +260,41 @@ def main() -> int:
     logging.root.addHandler(handler)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    main_task = loop.create_task(async_main())
+    stopping = False
+    previous_handlers = {}
+
+    def request_shutdown(signum, frame):
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            loop.call_soon_threadsafe(main_task.cancel)
+
     try:
-        return loop.run_until_complete(async_main())
-    except:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, request_shutdown)
+        return loop.run_until_complete(main_task)
+    except asyncio.CancelledError:
+        logging.info("Export interrupted; browser cleanup complete")
+        return 130
+    except Exception:
         import traceback
 
         traceback.print_exc()
         return -1
+    finally:
+        for signum, previous_handler in previous_handlers.items():
+            signal.signal(signum, previous_handler)
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        asyncio.set_event_loop(None)
+        logging.root.removeHandler(handler)
+        handler.close()
 
 
 if __name__ == "__main__":

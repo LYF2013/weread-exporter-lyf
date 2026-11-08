@@ -60,14 +60,14 @@ class WeReadWebPage(object):
             book_id,
         )
         self._chapter_root_url: str = self.__class__.root_url + "/web/reader/"
-        self._hook_script_name: str = "1.%s.js" % "".join(
-            [random.choice("0123456789abcdef") for _ in range(8)]
-        )
+        self._launcher = None
         self._browser: Optional[pyppeteer.browser.Browser] = None
         self._page: Optional[pyppeteer.page.Page] = None
         self._load_cookie()
         self._url: str = ""
         self._proxy_installed: bool = False
+        self._hook_installed: bool = False
+        self._headless: bool = False
 
     async def get_book_info(self) -> Dict[str, Any]:
         html = (await utils.fetch(self._home_url)).decode()
@@ -101,7 +101,7 @@ class WeReadWebPage(object):
     async def get_user_info(self) -> Dict[str, Any]:
         vid: str = self._cookie.get("wr_vid", "")
         if not vid:
-            raise utils.InvalidUserError("Invalid cookie: %s" % self._format_cookie())
+            raise utils.InvalidUserError("Login cookie is missing wr_vid")
         url: str = "%s/web/user?userVid=%s" % (self.__class__.root_url, vid)
         headers: Dict[str, str] = {
             "Referer": self.__class__.root_url,
@@ -115,27 +115,28 @@ class WeReadWebPage(object):
             )
             _, rsp_headers, _ = cast(Tuple[int, Dict[str, str], bytes], result)
             for it in rsp_headers.getall("Set-Cookie", []):
-                cookie = it.split("; ")[0]
+                cookie = it.split(";", 1)[0]
                 if "=" not in cookie:
                     logging.warning(
-                        "[%s] Ignore invalid cookie: %s"
-                        % (self.__class__.__name__, cookie)
+                        "[%s] Ignore invalid Set-Cookie header"
+                        % self.__class__.__name__
                     )
                     continue
                 key, value = cookie.split("=", 1)
                 self._cookie[key] = value
                 logging.info(
-                    "[%s] Update cookie %s" % (self.__class__.__name__, cookie)
+                    "[%s] Update cookie %s" % (self.__class__.__name__, key)
                 )
-            self._save_cookie()
             headers["Cookie"] = self._format_cookie()
             rsp = await utils.fetch(url, headers=headers)
             rsp_data = json.loads(rsp.decode())
+        if rsp_data.get("errCode") == -2012:
+            raise utils.InvalidUserError("Login session expired after refresh")
         elif rsp_data.get("errCode") == -2010:
             # 用户不存在
             raise utils.InvalidUserError("User %s not found" % vid)
         elif rsp_data.get("errCode"):
-            raise RuntimeError("Get user info failed: %s" % rsp_data)
+            raise RuntimeError("Get user info failed: errCode=%s" % rsp_data["errCode"])
         return rsp_data
 
     def _load_cookie(self) -> None:
@@ -180,6 +181,16 @@ class WeReadWebPage(object):
 
     async def _update_cookie(self) -> None:
         self._cookie = await self._read_cookie()
+
+    async def _verify_login(self) -> None:
+        await self._update_cookie()
+        if not self._cookie.get("wr_vid") or not self._cookie.get("wr_skey"):
+            raise utils.InvalidUserError("Login session cookies are incomplete")
+        browser_cookie = self._cookie.copy()
+        await self.get_user_info()
+        if self._cookie != browser_cookie:
+            await self._inject_cookie()
+        self._save_cookie()
 
     async def check_valid(self) -> bool:
         html = await utils.fetch(self._home_url)
@@ -239,9 +250,11 @@ class WeReadWebPage(object):
         use_default_profile: bool = False,
         mock_user_agent: bool = False,
         proxy_server: Optional[str] = None,
+        login_timeout: int = 60,
     ) -> None:
         logging.info("[%s] Launch url %s" % (self.__class__.__name__, self._home_url))
         chrome: str = self._check_chrome()
+        self._headless = headless
 
         # 检查 Chrome 版本并在使用默认 profile 时发出警告
         if use_default_profile:
@@ -270,13 +283,20 @@ class WeReadWebPage(object):
         logging.info(
             "[%s] Chrome args: chrome %s" % (self.__class__.__name__, " ".join(args))
         )
-        self._browser = await pyppeteer.launch(
+        self._proxy_installed = False
+        self._hook_installed = False
+        self._launcher = pyppeteer.launcher.Launcher(
             executablePath=chrome,
             ignoreDefaultArgs=True,
             args=args,
             defaultViewport=None,
             logLevel=logging.INFO,
+            handleSIGINT=False,
+            handleSIGTERM=False,
+            handleSIGHUP=False,
+            autoClose=False,
         )
+        self._browser = await self._launcher.launch()
         self._page = (await self._browser.pages())[0]
         await self._page.evaluateOnNewDocument(
             """() => {
@@ -356,15 +376,33 @@ class WeReadWebPage(object):
         await self._page.goto(self._home_url)
         # await self.wait_for_selector("div.readerFooter a")
         if force_login:
-            await self.login()
-        if self._cookie:
+            await self.login(timeout=login_timeout)
+        if force_login or self._cookie:
             await self.wait_for_avatar()
         self._page.on("console", self.handle_log)
 
     async def close(self) -> None:
-        if self._browser:
-            await self._browser.close()
-            self._browser = self._page = None
+        process = getattr(self._launcher, "proc", None)
+        try:
+            if self._browser:
+                await asyncio.wait_for(self._browser.close(), timeout=10)
+            elif self._launcher and process:
+                await asyncio.wait_for(self._launcher.killChrome(), timeout=10)
+        finally:
+            try:
+                if process and process.poll() is None:
+                    process.terminate()
+                    loop = asyncio.get_running_loop()
+                    try:
+                        await loop.run_in_executor(None, process.wait, 5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        await loop.run_in_executor(None, process.wait, 5)
+            finally:
+                self._browser = self._page = None
+                self._launcher = None
+                self._proxy_installed = False
+                self._hook_installed = False
 
     async def get_html(self) -> str:
         return await self._page.evaluate("document.documentElement.outerHTML;")
@@ -405,7 +443,8 @@ class WeReadWebPage(object):
             avatar_url = await self._page.evaluate(
                 "document.querySelector('img.wr_avatar_img') && document.querySelector('img.wr_avatar_img').getAttribute('src');"
             )
-            if avatar_url is None or not avatar_url.endswith("Default.svg"):
+            if avatar_url and "Default.svg" not in avatar_url:
+                await self._verify_login()
                 break
             await asyncio.sleep(5)
         else:
@@ -414,8 +453,8 @@ class WeReadWebPage(object):
     async def _inject_cookie(self) -> None:
         for key in self._cookie:
             logging.info(
-                "[%s] Inject cookie %s=%s"
-                % (self.__class__.__name__, key, self._cookie[key])
+                "[%s] Inject cookie %s"
+                % (self.__class__.__name__, key)
             )
             await self._page.setCookie(
                 {
@@ -426,36 +465,94 @@ class WeReadWebPage(object):
                 }
             )
 
-    async def login(self) -> bool:
+    async def login(self, timeout: int = 60) -> bool:
         selectors = [
             "button.navBar_link_Login",
             "div.readerTopBar_right button.actionItem",
         ]
+        await asyncio.sleep(2)
         for selector in selectors:
+            try:
+                await self._page.waitForSelector(selector, timeout=5000)
+            except Exception:
+                continue
             script = (
                 "var elem = document.querySelector('%s'); elem && elem.innerText"
                 % (selector)
             )
-            result = await self._page.evaluate(script)
+            try:
+                result = await self._page.evaluate(script)
+            except Exception as e:
+                logging.warning(
+                    "[%s] Failed to evaluate script: %s"
+                    % (self.__class__.__name__, e)
+                )
+                continue
             if not result:
                 continue
             if "登录" not in result:
                 continue
             await self._page.click(selector)
-            script = "document.querySelector('div.menu_container img.wr_avatar_img')"
             time0 = time.time()
-            while time.time() - time0 < 300:
-                logging.info("[%s] Waiting for login" % self.__class__.__name__)
-                await asyncio.sleep(10)
-                result = await self._page.evaluate(script)
+
+            # Better user prompt for login
+            print("\n" + "=" * 60)
+            print("📱 WeChat Login Required")
+            print("=" * 60)
+            print("1. A QR code is displayed in the browser window")
+            print("2. Open WeChat on your mobile phone")
+            print("3. Scan the QR code to log in")
+            print("4. Waiting for you to scan...")
+            print(f"⏱️  Timeout: {timeout} seconds")
+            print("=" * 60 + "\n")
+
+            while time.time() - time0 < timeout:
+                elapsed = int(time.time() - time0)
+                remaining = timeout - elapsed
+                if elapsed % 10 == 0 and elapsed > 0:
+                    logging.info(
+                        "[%s] Waiting for login... (%d seconds remaining)"
+                        % (self.__class__.__name__, remaining)
+                    )
+                await asyncio.sleep(1)
+                try:
+                    # 头像存在且不是默认头像才算登录成功
+                    result = await self._page.evaluate(
+                        "var elem = document.querySelector('div.menu_container img.wr_avatar_img');"
+                        " elem && elem.getAttribute('src') && elem.getAttribute('src').indexOf('Default.svg') < 0;"
+                    )
+                except Exception as e:
+                    logging.warning(
+                        "[%s] Failed to evaluate during login wait: %s"
+                        % (self.__class__.__name__, e)
+                    )
+                    continue
                 if not result:
                     continue
-                logging.info("[%s] Login success" % self.__class__.__name__)
-                await self._update_cookie()
-                self._save_cookie()
+                # 等服务端把完整 cookie（wr_name/wr_skey 等）下发完
+                await asyncio.sleep(2)
+                try:
+                    await self._verify_login()
+                except utils.InvalidUserError:
+                    logging.warning(
+                        "[%s] Avatar detected but session not verified, keep waiting..."
+                        % self.__class__.__name__
+                    )
+                    continue
+                logging.info("[%s] Login success!" % self.__class__.__name__)
+                print("\n✅ Login successful! Continuing export...\n")
                 return True
             else:
-                raise RuntimeError("Login timeout")
+                print("\n" + "=" * 60)
+                print("❌ Login Timeout")
+                print("=" * 60)
+                print(f"The login process timed out after {timeout} seconds.")
+                print("Please:")
+                print("  1. Check if the browser window is visible")
+                print("  2. Make sure you have WeChat installed on your phone")
+                print("  3. Try again with a longer timeout: --login-timeout 120")
+                print("=" * 60 + "\n")
+                raise RuntimeError(f"Login timeout after {timeout} seconds")
         return False
 
     async def _get_from_cache_or_server(
@@ -496,38 +593,17 @@ class WeReadWebPage(object):
                 message += " %s" % request.content
             logging.info(message)
 
-    def on_document_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
+    async def on_document_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
         """ """
-        cookie = request.headers.get("cookie", "")
-        cookie += "; wr_useHorizonReader=0"
-        request.headers["cookie"] = cookie
+        cookies = await self._page.cookies(request.url)
+        values = [
+            "%s=%s" % (cookie["name"], cookie["value"])
+            for cookie in cookies
+            if cookie["name"] != "wr_useHorizonReader"
+        ]
+        values.append("wr_useHorizonReader=0")
+        request.headers["cookie"] = "; ".join(values)
         return {"type": webproxy.EnumProxyType.Continue, "headers": request.headers}
-
-    def on_document_response(self, response: "webproxy.WebResponse") -> Dict[str, Any]:
-        content = response.content
-        inject_script = (
-            "<script src='https://cdn.weread.qq.com/web/%s'></script>\n"
-            % self._hook_script_name
-        )
-        content = content.replace("</head>", inject_script + "</head>")
-        return {
-            "status": response.status,
-            "headers": response.headers,
-            "body": content.encode("utf-8"),
-        }
-
-    def on_hook_script_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
-        with open(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "hook.js"),
-            "rb",
-        ) as fp:
-            hook_script = fp.read()
-            return {
-                "type": webproxy.EnumProxyType.Mock,
-                "status": 200,
-                "headers": {"Content-Type": "application/json"},
-                "body": hook_script,
-            }
 
     def on_log_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
         self._log_request(request)
@@ -583,9 +659,19 @@ class WeReadWebPage(object):
         return {"type": webproxy.EnumProxyType.Continue}
 
     async def pre_load_page(self) -> None:
+        if not self._hook_installed:
+            with open(os.path.join(os.path.dirname(__file__), "hook.js"), encoding="utf-8") as fp:
+                hook_script = fp.read()
+            await self._page.evaluateOnNewDocument(
+                "() => {"
+                "if (location.hostname !== 'weread.qq.com' || "
+                "!location.pathname.startsWith('/web/reader/')) return;\n"
+                + hook_script
+                + "\nwindow.canvasContextHandler = canvasContextHandler;\n}"
+            )
+            self._hook_installed = True
         if self._proxy_installed:
             return
-        self._proxy_installed = True
         # await self._page.setRequestInterception(True)
         rules = [
             webproxy.ProxyRule("*/hera/*", self.on_log_request),
@@ -595,23 +681,25 @@ class WeReadWebPage(object):
             webproxy.ProxyRule(
                 "*/web/reader/*", self.on_document_request, resource_type="Document"
             ),
-            webproxy.ProxyRule(
-                "*/web/reader/*",
-                self.on_document_response,
-                resource_type="Document",
-                stage=webproxy.EnumProxyStage.Response,
-            ),
-            webproxy.ProxyRule(
-                "*/web/%s" % self._hook_script_name,
-                self.on_hook_script_request,
-                resource_type="Script",
-            ),
         ]
         proxy = webproxy.WebProxy(self._page, rules)
         await proxy.setup_interception()
+        self._proxy_installed = True
         # self._page.on("request", self.handle_request)
 
+    async def _wait_for_hook(self) -> None:
+        try:
+            await self._page.waitForFunction(
+                "typeof canvasContextHandler !== 'undefined' && !!canvasContextHandler.data",
+                timeout=10000,
+            )
+        except pyppeteer.errors.TimeoutError as ex:
+            raise utils.LoadChapterFailedError(
+                "Reader hook did not initialize; chapter will not be saved"
+            ) from ex
+
     async def get_markdown(self) -> str:
+        await self._wait_for_hook()
         script = "canvasContextHandler.data.complete;"
         time0 = time.time()
         while time.time() - time0 < 10:
@@ -626,9 +714,38 @@ class WeReadWebPage(object):
             result = await self._page.evaluate(script)
             if not result:
                 raise RuntimeError("Wait for creating markdown timeout")
+
+        # Check if content indicates login is required
+        if not result or len(result.strip()) < 10:
+            raise utils.LoginRequiredError("Empty content - login required")
+
+        # Check for common login/permission prompts in Chinese
+        login_prompts = [
+            "登录后阅读",
+            "请登录",
+            "登录后查看",
+            "购买后阅读",
+            "订阅后阅读",
+            "本章为付费章节",
+            "试读结束",
+        ]
+        for prompt in login_prompts:
+            if prompt in result:
+                logging.warning(
+                    "[%s] Detected login prompt in content: %s"
+                    % (self.__class__.__name__, prompt)
+                )
+                raise utils.LoginRequiredError(
+                    f"Content contains login prompt: {prompt}"
+                )
+
         return result
 
     async def _check_next_page(self) -> None:
+        # Track consecutive pages to detect infinite loops
+        consecutive_next_page = 0
+        max_consecutive_pages = 50  # Safety limit
+
         while True:
             try:
                 await self.wait_for_selector("button.readerFooter_button", timeout=60)
@@ -638,7 +755,31 @@ class WeReadWebPage(object):
             result = await self._page.evaluate(
                 "document.getElementsByClassName('readerFooter_button')[0].innerText;"
             )
+
+            # Check for login prompts in button text
+            if result.startswith("登录"):
+                raise utils.LoginRequiredError()
+
+            # Check for purchase/subscription prompts
+            if any(keyword in result for keyword in ["购买", "订阅", "付费", "会员"]):
+                raise utils.LoginRequiredError(
+                    f"Chapter requires purchase/subscription: {result}"
+                )
+
+            await self._wait_for_hook()
             if result == "下一页":
+                consecutive_next_page += 1
+                if consecutive_next_page > max_consecutive_pages:
+                    raise utils.LoginRequiredError(
+                        f"Exceeded maximum page count ({max_consecutive_pages}) - "
+                        "likely stuck in a loop or hitting paywall"
+                    )
+                delay = random.uniform(30, 60)
+                logging.info(
+                    "[%s] Rest %.0fs before next page"
+                    % (self.__class__.__name__, delay)
+                )
+                await asyncio.sleep(delay)
                 logging.info("[%s] Go to next page" % self.__class__.__name__)
                 await self._page.evaluate(
                     r"canvasContextHandler.data.markdown += '\n\n';"
@@ -660,7 +801,9 @@ class WeReadWebPage(object):
             utils.wr_hash(str(chapter_id)),
         )
 
-    async def goto_chapter(self, chapter_id: str, timeout: int = 120) -> None:
+    async def goto_chapter(
+        self, chapter_id: str, timeout: int = 120, retried: bool = False
+    ) -> None:
         logging.info("[%s] Go to chapter %s" % (self.__class__.__name__, chapter_id))
         # await self.clear_cache()
         await self.pre_load_page()
@@ -669,8 +812,23 @@ class WeReadWebPage(object):
         try:
             await self._check_next_page()
         except utils.LoginRequiredError:
-            await self.login()
-            return await self.goto_chapter(chapter_id, timeout=timeout)
+            if self._headless:
+                raise utils.LoginRequiredError(
+                    "Login session expired in headless mode. Re-run with "
+                    "--force-login (and remove --headless) to refresh the session."
+                )
+            if retried:
+                raise utils.LoginRequiredError(
+                    "Login session expired and interactive re-login did not help. "
+                    "Re-run with --force-login to login again."
+                )
+            logging.warning(
+                "[%s] Login session expired, try interactive re-login once"
+                % self.__class__.__name__
+            )
+            if not await self.login():
+                raise utils.LoginRequiredError("Interactive re-login did not complete")
+            return await self.goto_chapter(chapter_id, timeout=timeout, retried=True)
 
     async def clear_cache(self) -> None:
         await self._page.evaluate("canvasContextHandler.clearCanvasCache();")

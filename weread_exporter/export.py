@@ -2,9 +2,11 @@ from weread_exporter.webpage import WeReadWebPage
 
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import random
 import sys
 import time
 from typing import Dict, List, Optional, Any
@@ -329,12 +331,17 @@ class WeReadExporter(object):
         with open(self._cover_image_path, "wb") as fp:
             fp.write(data)
 
-    async def export_markdown(self, timeout: int = 60, interval: int = 30) -> None:
+    async def export_markdown(self, timeout: int = 60, interval: int = 60) -> None:
         if not os.path.isdir(self._chapter_dir):
             os.makedirs(self._chapter_dir)
         meta_data = await self._load_meta_data()
         if not os.path.isfile(self._cover_image_path):
             await self.save_cover_image()
+
+        # Track previous chapter content to detect infinite loops
+        prev_chapter_hash = None
+        duplicate_count = 0
+        max_duplicates = 2
 
         for index, chapter in enumerate(meta_data["chapters"]):
             logging.info(
@@ -344,6 +351,8 @@ class WeReadExporter(object):
 
             file_path = self._make_chapter_path(index, chapter["id"])
             if os.path.isfile(file_path) and os.path.getsize(file_path) > 3:
+                # Reset duplicate counter on successful chapters
+                duplicate_count = 0
                 continue
             logging.info(
                 "[%s] File %s not exist" % (self.__class__.__name__, file_path)
@@ -353,12 +362,14 @@ class WeReadExporter(object):
             for _ in range(3):
                 time0 = time.time()
                 try:
+                    # 章节总耗时包含逐页模拟阅读停留，预算按字数放宽
+                    reading_budget = int(chapter.get("words", 0) / 4) + 120
                     await asyncio.wait_for(
                         self._page.goto_chapter(
                             chapter["id"],
                             timeout=timeout,
                         ),
-                        timeout=timeout + 60,
+                        timeout=timeout + reading_budget,
                     )  # avoid pyppeteer hangs
                 except asyncio.TimeoutError:
                     logging.warning(
@@ -370,8 +381,8 @@ class WeReadExporter(object):
                         )
                     )
                     raise utils.LoadChapterFailedError()
-                except KeyboardInterrupt as ex:
-                    raise ex
+                except (asyncio.CancelledError, KeyboardInterrupt, utils.LoginRequiredError, utils.LoadChapterFailedError):
+                    raise
                 except:
                     logging.exception(
                         "[%s] Go to chapter %s failed"
@@ -385,6 +396,24 @@ class WeReadExporter(object):
                 )
 
             markdown_content = await self._page.get_markdown()
+
+            # Detect duplicate content to prevent infinite loops
+            current_hash = hashlib.md5(markdown_content.encode("utf-8")).hexdigest()
+            if prev_chapter_hash == current_hash:
+                duplicate_count += 1
+                logging.warning(
+                    "[%s] Duplicate content detected (count: %d/%d)"
+                    % (self.__class__.__name__, duplicate_count, max_duplicates)
+                )
+                if duplicate_count >= max_duplicates:
+                    raise utils.LoginRequiredError(
+                        "Detected repeated identical chapters - likely hitting paywall or not logged in. "
+                        "Please check your login status or verify that you have access to this book."
+                    )
+            else:
+                duplicate_count = 0
+                prev_chapter_hash = current_hash
+
             logging.info(
                 "[%s] Export chapter %s to %s"
                 % (self.__class__.__name__, chapter["title"], file_path)
@@ -392,4 +421,9 @@ class WeReadExporter(object):
             with open(file_path, "wb") as fp:
                 fp.write(markdown_content.encode("utf-8", errors="replace"))
 
-            await asyncio.sleep(interval)
+            rest = interval + random.uniform(0, 90)
+            logging.info(
+                "[%s] Rest %.0fs before next chapter"
+                % (self.__class__.__name__, rest)
+            )
+            await asyncio.sleep(rest)

@@ -4,7 +4,6 @@ dist/
 output/
 *.epub
 *.pdf
-*.md
 *.log
 *.egg-info/
 
@@ -17,8 +16,25 @@ __pycache__/
 *.egg
 *.egg-info/
 .Python
-.env
+.env*
 .venv
 env/
 venv/
 ENV/
+
+# Local diagnostics and reference copies
+/_upstream/
+/test_photo/
+/test_login.py
+/screenshot.jpg
+/webpage.html
+
+# Local editor and assistant configuration
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.codex/
+.agents/
+.claude/
+.mcp.json

@@ -1,3 +1,4 @@
+const hookDebug = false;
 const defaultFontColor = "rgb(208, 211, 216)";
 function getPreElemList() {
   let preList = [];
@@ -106,7 +107,7 @@ let canvasContextHandler = {
         return function (...args) {
           if (name == "fillText") {
             if (args[1] == 0) {
-              console.log(name, ...args, that.data.lastPos);
+              hookDebug && console.log(name, ...args, that.data.lastPos);
             }
             if (args[0].startsWith("abcdefghijklmn")) {
               return target[name](...args);
@@ -118,7 +119,7 @@ let canvasContextHandler = {
               }
             }
             if (that.data.fontSizeChanged && that.data.fontSize <= 18) {
-              console.log("add sup tag");
+              hookDebug && console.log("add sup tag");
               if (that.data.highlightMode) {
                 that.data.markdown += "`";
               }
@@ -138,7 +139,7 @@ let canvasContextHandler = {
               // new line
               that.checkElement(that.data.lastPos[1], args[2]);
 
-              console.log("font", that.data.fontSize, that.data.fontColor, that.data.fontColorChanged);
+              hookDebug && console.log("font", that.data.fontSize, that.data.fontColor, that.data.fontColorChanged);
 
               if (that.data.fontSize >= 27) {
                 that.ensureHighlightClosed();
@@ -188,7 +189,7 @@ let canvasContextHandler = {
             setTimeout(function () {
               let imgList = getImgElemList();
               if (imgList.length > that.data.imgList.length) {
-                console.log("Found new images", that.data.imgList.length, "=>", imgList.length);
+                hookDebug && console.log("Found new images", that.data.imgList.length, "=>", imgList.length);
                 for (let i = that.data.imgList.length; i < imgList.length; i++) {
                   that.data.markdown += "\n\n![](" + imgList[i][2] + ")\n";
                 }
@@ -199,20 +200,20 @@ let canvasContextHandler = {
           } else if (name === "clearRect") {
             that.clearCanvasCache();
           } else {
-            console.log("call", name, args);
+            hookDebug && console.log("call", name, args);
           }
           return target[name](...args);
         }
       } else {
         let value = target[name];
-        console.log("prop", name, value);
+        hookDebug && console.log("prop", name, value);
         return value;
       }
     }
     return `Value for attribute ${name}`
   },
   set(target, name, value) {
-    console.log("set", name, value);
+    hookDebug && console.log("set", name, value);
     if (name === "font") {
       let fontSize = 0;
       for (let it of value.split(" ")) {
@@ -260,7 +261,7 @@ let canvasContextHandler = {
 
 let origGetContext = HTMLCanvasElement.prototype.getContext;
 HTMLCanvasElement.prototype.getContext = function (s) {
-  console.log("getContext", s);
+  hookDebug && console.log("getContext", s);
   ctx = origGetContext.call(this, s);
   canvasContextHandler.data.preList = getPreElemList();
   canvasContextHandler.data.imgList = getImgElemList();
